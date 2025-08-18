@@ -39,6 +39,7 @@ pub fn main() {
         thread::spawn(move || {
             let mut i = 0;
             while true {
+                
                 // Simulate demuxing
                 info!("DemuxerThread: demuxing next packet");
                 thread::sleep(Duration::from_millis(700));

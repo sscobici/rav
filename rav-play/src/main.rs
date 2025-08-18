@@ -12,21 +12,31 @@
 //     Ok(())
 // }
 
-use std::{fmt::Error, fs, io::{self, Cursor}};
+use std::{fmt::Error, fs, io::{self, Cursor, Read}};
 
+#[derive(Debug)]
+pub struct Packet<'a> {
+    pub data: &'a [u8],
+}
 
-pub fn main() -> io::Result<()> {
-    let data = fs::read("myfile.mkv")?;
-    let buf = data.as_slice();
-    let pos: usize = 0;
-    let it = buf.iter();
+pub fn main() {
+    // Get the first command line argument.
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(1).expect("file path not provided");
 
-    if buf.len() < 20 {
-        return Err(io::Error::other("file is too short"));
+    // Open the media source.
+    let mut src = std::fs::File::open(path).expect("failed to open media");
+
+    const BUFFER_COUNT: usize = 10;
+    const BUFFER_SIZE: usize = 1_048_576; // 1MB
+    let mut buf_pool: Vec<Vec<u8>> = (0..BUFFER_COUNT)
+        .map(|_| Vec::with_capacity(BUFFER_SIZE))
+        .collect();
+
+    for _ in 0..2 {
+        if let Some(mut buffer) = buf_pool.pop() {
+            src.read_exact(&mut buffer).unwrap();
+            //demuxer.add_buffer(id, buffer); // Ownership transferred to demuxer
+        }
     }
-    if buf[pos..pos+4] != u32::to_le_bytes(0x1a45dfa3) {
-        return Err(io::Error::other("doesn't start with EBML Header"));
-    }
-    let size = buf[5]; 
-    Ok(())
 }

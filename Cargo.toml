@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "rav",
     "rav-play",
-    "rav-ffi"
-, "rav-format-ts"]
+    "rav-ffi",
+    "rav-format-ts"
+]
 
