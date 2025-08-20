@@ -30,10 +30,14 @@ impl<'a> Packet<'a> {
         }
     }
 }
+
+
 // --- Error Type ---
 /// Defines errors that can occur while operating the MediaSourceStream.
 #[derive(Debug, PartialEq)]
 pub enum MediaError {
+    /// Not enough data in the stream to complete the operation.
+    InvalidParam,
     /// Not enough data in the stream to complete the operation.
     NotEnoughData,
     /// The ring buffer is full and cannot accept a new IoBuf.
@@ -50,11 +54,13 @@ pub enum MediaError {
 #[derive(Debug, Clone, Default)]
 pub struct IoRef {
     /// A shared, immutable reference to the underlying byte buffer.
-    buf: Option<Arc<[u8]>>,
+    pub(crate) shared_buf: Option<Arc<[u8]>>,
+    /// Owned buf in case the data was copied
+    pub(crate) buf: Option<Box<[u8]>>,
     /// The starting position of this reference within the buffer.
-    offset: usize,
+    pub(crate) offset: usize,
     /// The length of the data segment this reference points to.
-    len: usize,
+    pub(crate) len: usize,
 }
 
 /// A packet of data that can be composed of up to 4 non-contiguous buffer segments.
@@ -63,25 +69,7 @@ pub struct IoRef {
 #[derive(Debug, Default)]
 pub struct Packet2 {
     /// An array of buffer references that constitute the packet's data.
-    pub bufs: [IoRef; 4],
-}
-
-impl Packet2 {
-    /// Resets the packet to its default, empty state.
-    pub fn clear(&mut self) {
-        // Replace each IoRef with a default, effectively dropping any Arcs.
-        self.bufs = Default::default();
-    }
-
-    /// Returns the total length of the data contained in the packet.
-    pub fn len(&self) -> usize {
-        self.bufs.iter().map(|b| b.len).sum()
-    }
-
-    /// Returns the number of valid IoRefs in the packet.
-    pub fn bufs_len(&self) -> usize {
-        self.bufs.iter().filter(|ioref| ioref.buf.is_some()).count()
-    }
+    pub ioref: IoRef,
 }
 
 /// A contiguous block of memory, owned and shared via an Arc.
@@ -93,16 +81,6 @@ pub struct IoBuf {
     pub(crate) len: usize,
 }
 
-impl IoBuf {
-    /// Creates a new IoBuf from a Vec<u8>.
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        let len = data.len();
-        IoBuf {
-            buf: Arc::from(data),
-            len,
-        }
-    }
-}
 
 /// Represents a decoded, raw media frame, which always resides in hardware.
 #[repr(C)]
