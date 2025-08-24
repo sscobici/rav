@@ -65,9 +65,12 @@ impl Demuxer {
 
 /// A stream that consumes IoBufs from a fixed-size ring buffer.
 /// It allows for zero-copy reading of data into Packets.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MediaSourceStream {
+    // ring of buffers, 
 	ring: [IoBuf; Self::RING_SIZE],
+	/// ring mask
+    ring_mask: usize,
 	/// The index where the IoBuf will be removed once the buffer is read.
 	ring_remove_idx: usize,
 	/// The index where the next IoBuf will be added.
@@ -82,9 +85,24 @@ pub struct MediaSourceStream {
 	stream_len: usize,
 }
 
+impl Default for MediaSourceStream {
+    fn default() -> Self {
+        Self {
+            ring: Default::default(),
+            ring_mask: MediaSourceStream::RING_MASK,
+            ring_remove_idx: 0,
+            ring_add_idx: 0,
+            ring_cur_idx: 0,
+            ring_cur_pos: 0,
+            stream_pos: 0,
+            stream_len: 0 }
+    }
+}
+
 impl MediaSourceStream {
-    /// The fixed size of the internal ring buffer.
+    /// The fixed size of the internal ring buffer, preferably to be equal to 2^n
     const RING_SIZE: usize = 4;
+    const RING_MASK: usize = MediaSourceStream::RING_SIZE - 1;
 
     /// Adds a new IoBuf to the stream's ring buffer. IoBuf.len should be greater than zero and less or equal than IoBuf.buf.len()
     pub fn add_iobuf(&mut self, iobuf: IoBuf) -> Result<(), MediaError> {
@@ -92,7 +110,7 @@ impl MediaSourceStream {
             return Err(MediaError::InvalidParam);
         }
 
-        let next_add_idx = (self.ring_add_idx + 1) % Self::RING_SIZE;
+        let next_add_idx = (self.ring_add_idx + 1) & self.ring_mask;
         // The buffer is full if the next add index would be the same as the remove index.
         // This means we can store up to RING_SIZE - 1 items.
         if next_add_idx == self.ring_remove_idx {
@@ -131,7 +149,7 @@ impl MediaSourceStream {
         self.ring_cur_pos += 1;
         self.stream_pos += 1;
         if self.ring_cur_pos == self.ring[self.ring_cur_idx].len {
-            self.ring_cur_idx = (self.ring_cur_idx + 1) % Self::RING_SIZE;
+            self.ring_cur_idx = (self.ring_cur_idx + 1) & self.ring_mask;
             self.ring_cur_pos = 0;
         }
 
@@ -160,7 +178,7 @@ impl MediaSourceStream {
             self.ring_cur_pos += len;
             self.stream_pos += len;
             if self.ring_cur_pos == self.ring[self.ring_cur_idx].len {
-                self.ring_cur_idx = (self.ring_cur_idx + 1) % Self::RING_SIZE;
+                self.ring_cur_idx = (self.ring_cur_idx + 1) & self.ring_mask;
                 self.ring_cur_pos = 0;
             }
 
@@ -169,10 +187,10 @@ impl MediaSourceStream {
 
         // Check if total available data is enough
         let mut total_available = cur_buf_remaining;
-        let mut idx = (self.ring_cur_idx + 1) % Self::RING_SIZE;
+        let mut idx = (self.ring_cur_idx + 1) & self.ring_mask;
         while idx != self.ring_add_idx && total_available < len {
             total_available += self.ring[idx].len;
-            idx = (idx + 1) % Self::RING_SIZE;
+            idx = (idx + 1) & self.ring_mask;
         }
 
         if total_available < len {
@@ -194,7 +212,7 @@ impl MediaSourceStream {
             remaining -= to_copy;
             cur_pos += to_copy;
             if cur_pos == self.ring[cur_idx].len {
-                cur_idx = (cur_idx + 1) % Self::RING_SIZE;
+                cur_idx = (cur_idx + 1) & self.ring_mask;
                 cur_pos = 0;
             }            
 
