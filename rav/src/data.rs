@@ -76,9 +76,9 @@ pub struct Packet2 {
 #[derive(Debug, Default)]
 pub struct IoBuf {
     /// The shared buffer. `None` if the IoBuf is empty/uninitialized.
-    pub(crate) buf: Arc<[u8]>,
+    pub buf: Arc<[u8]>,
     /// The length of the actual content in the buffer.
-    pub(crate) len: usize,
+    pub len: usize,
 }
 
 

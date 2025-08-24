@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
-
 use crate::data::{IoBuf, IoRef, MediaError, Packet, Packet2};
 use crate::io::IoContext;
 
@@ -105,6 +103,21 @@ impl MediaSourceStream {
         self.ring_add_idx = next_add_idx;
 
         Ok(())
+    }
+
+    /// Removes a parsed IoBuf from the stream's ring buffer. IoBuf should not have Packets referencing it
+    pub fn remove_iobuf(&mut self) -> Result<IoBuf, MediaError> {
+        if self.ring_remove_idx == self.ring_add_idx {
+            return Err(MediaError::NotEnoughData);
+        }
+
+        if Arc::strong_count(&self.ring[self.ring_remove_idx].buf) == 1 {
+            let iobuf = std::mem::take(&mut self.ring[self.ring_remove_idx]);
+            self.ring_remove_idx = (self.ring_remove_idx + 1) % Self::RING_SIZE;
+            return Ok(iobuf);
+        }
+
+        Err(MediaError::NotEnoughData)
     }
 
     /// Reads a single byte, advancing position.
@@ -254,6 +267,22 @@ mod tests {
     }
 
     #[test]
+    fn cannot_remove_referenced_buf() {
+        let mut stream = MediaSourceStream::default();
+        stream.add_iobuf(new_iobuf(b"a")).unwrap();
+
+        {
+            let mut ioref = IoRef::default();
+            let ioref = stream.read_ioref(&mut ioref, 1);
+            assert!(ioref.is_ok());
+            let result = stream.remove_iobuf();
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap(), MediaError::NotEnoughData);
+        }
+        assert!(stream.remove_iobuf().is_ok());
+    }
+
+    #[test]
     fn remove_one_and_add_one() {
         let mut stream = MediaSourceStream::default();
         // Add max possible bufs to leave one slot empty
@@ -265,9 +294,9 @@ mod tests {
         for _ in 0..2 {
             assert!(stream.get_u8().is_ok());
         }
-        // The read head should now be at index 3, and the remove index should be 3
+
         assert_eq!(stream.ring_cur_idx, 2);
-        stream.ring_remove_idx = stream.ring_cur_idx; // Simulate consumption
+        assert!(stream.remove_iobuf().is_ok());
 
         // Add a new buf, should succeed
         let new_buf = new_iobuf(b"test");
@@ -403,7 +432,9 @@ mod tests {
         assert_eq!(stream.ring_cur_idx, 2);
         assert_eq!(stream.ring_cur_pos, 0);
 
-        stream.ring_remove_idx = stream.ring_cur_idx; // Simulate consumption
+        // removing two bufs
+        assert!(stream.remove_iobuf().is_ok());
+        assert!(stream.remove_iobuf().is_ok());
 
         // add other 2 bufs
         stream.add_iobuf(new_iobuf(b"a")).unwrap();

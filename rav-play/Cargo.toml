@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 rav = { version = "0.1.0", path = "../rav" }
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "my_benchmark"
+harness = false
