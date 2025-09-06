@@ -1,0 +1,13 @@
+include_guard = "RAV_H"
+language = "C"
+cpp_compat = true
+no_includes = true
+sys_includes = ["stdint.h"]
+usize_is_size_t = true
+
+[parse]
+exclude = ["windows"]
+extra_bindings = ["rav"]
+
+[export]
+prefix = ""

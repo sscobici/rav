@@ -1,35 +1,70 @@
+
 use std::sync::Arc;
 
-use crate::data::{IoBuf, IoRef, MediaError, Packet, Packet2};
-use crate::io::IoContext;
+use crate::data::{IoBuf, IoRef, Packet};
+use crate::error::{invalid_input_error, retry_later_error, Result, Error};
 
 pub struct Stream {
     pub id: usize,
     pub codec_params: Vec<u8>,
 }
 
-pub struct FormatContext<'a> {
-    data: &'a [u8],
-    pos: usize,
+pub trait IoBufRing {
+    fn add_iobuf(&mut self, iobuf: IoBuf) -> Result<()>;
+    fn remove_iobuf(&mut self) -> Result<IoBuf>;
 }
 
-impl<'a> FormatContext<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        let pos: usize = 0;
-        if data[pos..pos+4] == b"EBML"[..] {
- 
-        }
-        Self { data, pos: 0 }
-    }
-
-    pub fn next_packet(&self, packet: &mut Packet<'a>) {
-        packet.clear();
-        packet.push(&self.data[..100]);
-    }
+pub trait IoBufSupply {
+    fn open_input(&mut self, uri: &str) -> Result<()>;
+    fn supply_iobufs(&mut self, len_bytes: usize, parsed_iobufs: &[IoBuf], new_iobufs: &mut [IoBuf]) -> Result<usize>;
 }
 
 
-type Error = Box<dyn std::error::Error>;
+#[derive(Debug)]
+pub struct IoBufSupplierIoUring {
+//    src: std::fs::File,
+}
+
+impl IoBufSupply for IoBufSupplierIoUring {
+    fn open_input(&mut self, uri: &str) -> Result<()> {
+//        self.src = std::fs::File::open(uri)?;
+        Ok(())
+    }
+
+    fn supply_iobufs(&mut self, len_bytes: usize, parsed_iobufs: &[IoBuf], new_iobufs: &mut [IoBuf]) -> Result<usize> {
+        // iobuf_ring.remove_iobuf()?;
+        // iobuf_ring.add_iobuf(iobuf);
+        Ok(0)
+    }
+}
+
+pub trait MediaIoBufRead {
+    fn get_u8(&mut self) -> Result<u8>;
+    fn get_ioref(&mut self, ioref: &mut IoRef, len: usize) -> Result<()>;
+}
+
+pub trait Demux {
+    fn read_packet(&mut self, packet: &mut Packet) -> Result<()>;
+}
+
+pub struct FormatContext {
+    demuxer: Box<dyn Demux>,
+}
+
+impl FormatContext {
+    pub fn open_input(uri: &str) -> Self {
+        let mut iobuf_supplier = IoBufSupplierIoUring {};
+        iobuf_supplier.open_input(uri);
+        let stream = MediaSourceStream::new(iobuf_supplier);
+        let demuxer = DemuxerMkv { iobuf_reader: stream };
+        Self { demuxer: Box::new(demuxer) }
+    }
+
+    pub fn read_packet(&mut self, packet: &mut Packet) -> Result<()> {
+        self.demuxer.read_packet(packet)
+    }
+}
+
 pub struct IoBuf2 {
     // buff allocated space
     data: Arc<[u8]>,
@@ -37,38 +72,27 @@ pub struct IoBuf2 {
     len: u64
 }
 
-pub struct Demuxer {
-    /// The ring buffer of IoBufs which are supplied to demuxer
-    ring: [IoBuf2; 4],
-    /// The ring buffer's wrap-around mask.
-    ring_mask: usize,
-    /// The read index in ring.
-    read_idx: usize,
-    /// The write index in ring
-    write_idx: usize,
-    /// Absolute position of the stream.
-    abs_pos: u64,
-    /// index in the ring where parsing currently is
-    cur_idx: usize,
-    /// 
-    cur_pos: u64,
+pub struct DemuxerMkv<S: MediaIoBufRead> {
+    iobuf_reader: S
 }
 
-impl Demuxer {
-//     pub fn read_packet(&self, packet: &mut Packet2) -> Result<(), Error> {
-//         packet.bufs[0] = self.bufs[0].clone();
-//         packet.offset = 0;
-//         packet.len = 5;
-//         Ok(())
-//     }
+impl<S: MediaIoBufRead> Demux for DemuxerMkv<S> {
+    fn read_packet(&mut self, packet: &mut Packet) -> Result<()> {
+        let b = self.iobuf_reader.get_u8()?;
+        Ok(())
+    }
 }
 
+/// The fixed size of the internal ring buffer, preferably to be equal to 2^n
+const RING_SIZE: usize = 4;
+const RING_MASK: usize = RING_SIZE - 1;
 /// A stream that consumes IoBufs from a fixed-size ring buffer.
 /// It allows for zero-copy reading of data into Packets.
 #[derive(Debug)]
-pub struct MediaSourceStream {
+pub struct MediaSourceStream<S: IoBufSupply> {
+    iobuf_supplier: S,
     // ring of buffers, 
-	ring: [IoBuf; Self::RING_SIZE],
+	ring: [IoBuf; RING_SIZE],
 	/// ring mask
     ring_mask: usize,
 	/// The index where the IoBuf will be removed once the buffer is read.
@@ -85,11 +109,12 @@ pub struct MediaSourceStream {
 	stream_len: usize,
 }
 
-impl Default for MediaSourceStream {
-    fn default() -> Self {
+impl<S: IoBufSupply> MediaSourceStream<S> {
+    pub fn new(iobuf_supplier: S) -> Self {
         Self {
+            iobuf_supplier,
             ring: Default::default(),
-            ring_mask: MediaSourceStream::RING_MASK,
+            ring_mask: RING_MASK,
             ring_remove_idx: 0,
             ring_add_idx: 0,
             ring_cur_idx: 0,
@@ -97,24 +122,61 @@ impl Default for MediaSourceStream {
             stream_pos: 0,
             stream_len: 0 }
     }
+    
+    fn supply_iobufs(&mut self, len_bytes: usize) -> Result<()> {
+        // get all parsed iobufs into array, can be 0
+        let mut parsed_iobufs: [IoBuf; RING_SIZE] = Default::default();
+        let mut count_parsed_iobufs = 0;
+        while count_parsed_iobufs < parsed_iobufs.len() {
+            match self.remove_iobuf() {
+                Ok(iobuf) => {
+                    parsed_iobufs[count_parsed_iobufs] = iobuf;
+                    count_parsed_iobufs += 1;
+                },
+                Err(_) => break,
+            }
+        }
+
+        // if we don't have space in ring - it means that non of the buffers were parsed
+        let max_new_iobufs = RING_SIZE - (self.ring_add_idx - self.ring_remove_idx + RING_SIZE) % RING_SIZE;
+        if max_new_iobufs == 0 {
+            return retry_later_error();  // all existing buffers are still referenced and cannot be released and there is no more space in ring buf
+        }
+
+        // supply parsed buffers and ask for new buffers to cover at least len_bytes
+        let mut new_iobufs: [IoBuf; RING_SIZE] = Default::default();
+        let count_new_iobufs = self.iobuf_supplier.supply_iobufs(
+            len_bytes,
+            &parsed_iobufs[0..count_parsed_iobufs],
+            &mut new_iobufs[0..max_new_iobufs])?;
+
+        let mut new_bytes = 0;
+        for iobuf in new_iobufs.iter_mut().take(count_new_iobufs) {
+            new_bytes += iobuf.len;
+            self.add_iobuf(std::mem::take(iobuf))?;  // TODO check that it doesn't fail - otherwise iobuf will be dealocated from heap.
+        }
+
+        if new_bytes < len_bytes {
+            return retry_later_error();
+        }
+        
+        Ok(())
+    }
 }
 
-impl MediaSourceStream {
-    /// The fixed size of the internal ring buffer, preferably to be equal to 2^n
-    const RING_SIZE: usize = 4;
-    const RING_MASK: usize = MediaSourceStream::RING_SIZE - 1;
+impl<S: IoBufSupply> IoBufRing for MediaSourceStream<S> {
 
     /// Adds a new IoBuf to the stream's ring buffer. IoBuf.len should be greater than zero and less or equal than IoBuf.buf.len()
-    pub fn add_iobuf(&mut self, iobuf: IoBuf) -> Result<(), MediaError> {
+    fn add_iobuf(&mut self, iobuf: IoBuf) -> Result<()> {
         if iobuf.len == 0 || iobuf.len > iobuf.buf.len() {
-            return Err(MediaError::InvalidParam);
+            return invalid_input_error();
         }
 
         let next_add_idx = (self.ring_add_idx + 1) & self.ring_mask;
         // The buffer is full if the next add index would be the same as the remove index.
         // This means we can store up to RING_SIZE - 1 items.
         if next_add_idx == self.ring_remove_idx {
-            return Err(MediaError::RingBufferFull);
+            return retry_later_error();
         }
 
         self.ring[self.ring_add_idx] = iobuf;
@@ -124,24 +186,27 @@ impl MediaSourceStream {
     }
 
     /// Removes a parsed IoBuf from the stream's ring buffer. IoBuf should not have Packets referencing it
-    pub fn remove_iobuf(&mut self) -> Result<IoBuf, MediaError> {
+    fn remove_iobuf(&mut self) -> Result<IoBuf> {
         if self.ring_remove_idx == self.ring_add_idx {
-            return Err(MediaError::NotEnoughData);
+            return retry_later_error();
         }
 
         if Arc::strong_count(&self.ring[self.ring_remove_idx].buf) == 1 {
             let iobuf = std::mem::take(&mut self.ring[self.ring_remove_idx]);
-            self.ring_remove_idx = (self.ring_remove_idx + 1) % Self::RING_SIZE;
+            self.ring_remove_idx = (self.ring_remove_idx + 1) % RING_SIZE;
             return Ok(iobuf);
         }
 
-        Err(MediaError::NotEnoughData)
+        retry_later_error()
     }
+}
+
+impl<S: IoBufSupply> MediaIoBufRead for MediaSourceStream<S> {
 
     /// Reads a single byte, advancing position.
-    pub fn get_u8(&mut self) -> Result<u8, MediaError> {
+    fn get_u8(&mut self) -> Result<u8> {
         if self.ring_cur_idx == self.ring_add_idx {
-            return Err(MediaError::NotEnoughData);
+            self.supply_iobufs(1)?;  // we need 1 byte
         }
         let result = self.ring[self.ring_cur_idx].buf[self.ring_cur_pos];
 
@@ -156,13 +221,13 @@ impl MediaSourceStream {
         Ok(result)
     }
 
-    pub fn read_ioref(&mut self, ioref: &mut IoRef, len: usize) -> Result<(), MediaError> {
+    fn get_ioref(&mut self, ioref: &mut IoRef, len: usize) -> Result<()> {
         if len == 0 {
-            return Err(MediaError::InvalidParam);
+            return invalid_input_error();
         }
 
         if self.ring_cur_idx == self.ring_add_idx {
-            return Err(MediaError::NotEnoughData);
+            return retry_later_error();
         }
 
         let cur_buf_remaining = self.ring[self.ring_cur_idx].len - self.ring_cur_pos;
@@ -194,7 +259,8 @@ impl MediaSourceStream {
         }
 
         if total_available < len {
-            return Err(MediaError::NotEnoughData);
+            // TODO need to read more data
+            return retry_later_error();
         }
 
         // Allocate and copy data from multiple IoBufs
@@ -234,7 +300,6 @@ impl MediaSourceStream {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -251,19 +316,19 @@ mod tests {
 
     #[test]
     fn add_single_buf() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
 
         let mut err_buf = new_iobuf(b"123");
         err_buf.len = 0;
-        assert_eq!(stream.add_iobuf(err_buf), Err(MediaError::InvalidParam));
+        assert_eq!(stream.add_iobuf(err_buf), Err(Error::InvalidInput));
 
         let mut err_buf = new_iobuf(b"123");
         err_buf.len = 4;
-        assert_eq!(stream.add_iobuf(err_buf), Err(MediaError::InvalidParam));
+        assert_eq!(stream.add_iobuf(err_buf), Err(Error::InvalidInput));
 
         let mut err_buf = new_iobuf(b"");
         err_buf.len = 1;
-        assert_eq!(stream.add_iobuf(err_buf), Err(MediaError::InvalidParam));
+        assert_eq!(stream.add_iobuf(err_buf), Err(Error::InvalidInput));
 
         let buf = new_iobuf(b"hello");
         assert!(stream.add_iobuf(buf).is_ok());
@@ -275,36 +340,36 @@ mod tests {
 
     #[test]
     fn add_three_bufs_and_check_full() {
-        let mut stream = MediaSourceStream::default();
-        for i in 0..MediaSourceStream::RING_SIZE - 1 {
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
+        for i in 0..RING_SIZE - 1 {
             let buf = new_iobuf(&[i as u8]);
             assert!(stream.add_iobuf(buf).is_ok());
         }
         let full_buf = new_iobuf(b"full");
-        assert_eq!(stream.add_iobuf(full_buf), Err(MediaError::RingBufferFull));
+        assert_eq!(stream.add_iobuf(full_buf), Err(Error::RetryLater));
     }
 
     #[test]
     fn cannot_remove_referenced_buf() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"a")).unwrap();
 
         {
             let mut ioref = IoRef::default();
-            let ioref = stream.read_ioref(&mut ioref, 1);
+            let ioref = stream.get_ioref(&mut ioref, 1);
             assert!(ioref.is_ok());
             let result = stream.remove_iobuf();
             assert!(result.is_err());
-            assert_eq!(result.err().unwrap(), MediaError::NotEnoughData);
+            assert_eq!(result.err().unwrap(), Error::RetryLater);
         }
         assert!(stream.remove_iobuf().is_ok());
     }
 
     #[test]
     fn remove_one_and_add_one() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         // Add max possible bufs to leave one slot empty
-        for i in 0..MediaSourceStream::RING_SIZE - 1 {
+        for i in 0..RING_SIZE - 1 {
             let buf = new_iobuf(&[i as u8]);
             assert!(stream.add_iobuf(buf).is_ok());
         }
@@ -326,42 +391,42 @@ mod tests {
     // --- read_ioref tests ---
     #[test]
     fn no_data() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         let mut ioref = IoRef::default();
 
         // Requesting 0 bytes, but no data is available
-        assert_eq!(stream.read_ioref(&mut ioref, 0), Err(MediaError::InvalidParam));
+        assert_eq!(stream.get_ioref(&mut ioref, 0), Err(Error::InvalidInput));
 
         // Requesting 1 bytes, but no data is available
-        assert_eq!(stream.read_ioref(&mut ioref, 1), Err(MediaError::NotEnoughData));
+        assert_eq!(stream.get_ioref(&mut ioref, 1), Err(Error::RetryLater));
     }
 
     #[test]
     fn not_enough_data_in_current_buf() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"a")).unwrap();
         let mut ioref = IoRef::default();
         // Requesting 2 bytes, but only 1 are available
-        assert_eq!(stream.read_ioref(&mut ioref, 2), Err(MediaError::NotEnoughData));
+        assert_eq!(stream.get_ioref(&mut ioref, 2), Err(Error::RetryLater));
     }
 
     #[test]
     fn not_enough_data_in_all_bufs() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"a")).unwrap();
         stream.add_iobuf(new_iobuf(b"b")).unwrap();
         let mut ioref = IoRef::default();
         // Requesting 3 bytes, but only 2 are available
-        assert_eq!(stream.read_ioref(&mut ioref, 3), Err(MediaError::NotEnoughData));
+        assert_eq!(stream.get_ioref(&mut ioref, 3), Err(Error::RetryLater));
     }
 
     #[test]
     fn data_found_in_single_buf_more_data_remain() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"abcdef")).unwrap();
         let mut ioref = IoRef::default();
         // Read 3 bytes
-        assert!(stream.read_ioref(&mut ioref, 3).is_ok());
+        assert!(stream.get_ioref(&mut ioref, 3).is_ok());
         assert_eq!(ioref.len, 3);
         assert_eq!(ioref.offset, 0);
         // The shared buf should be the same
@@ -372,11 +437,11 @@ mod tests {
 
     #[test]
     fn data_found_in_single_buf_no_more_data_remain() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"abcd")).unwrap();
         let mut ioref = IoRef::default();
         // Read all 4 bytes
-        assert!(stream.read_ioref(&mut ioref, 4).is_ok());
+        assert!(stream.get_ioref(&mut ioref, 4).is_ok());
         assert_eq!(ioref.len, 4);
         assert!(ioref.shared_buf.is_some());
         // The stream should advance to the next buffer
@@ -386,12 +451,12 @@ mod tests {
 
     #[test]
     fn data_found_in_two_bufs_more_data_remain() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"abc")).unwrap();
         stream.add_iobuf(new_iobuf(b"def")).unwrap();
         let mut ioref = IoRef::default();
         // Read 5 bytes, spanning two bufs
-        assert!(stream.read_ioref(&mut ioref, 5).is_ok());
+        assert!(stream.get_ioref(&mut ioref, 5).is_ok());
         assert_eq!(ioref.len, 5);
         // This read should result in a copy
         assert!(ioref.buf.is_some());
@@ -404,12 +469,12 @@ mod tests {
 
     #[test]
     fn data_found_in_two_bufs_no_more_data_remain() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"abc")).unwrap();
         stream.add_iobuf(new_iobuf(b"de")).unwrap();
         let mut ioref = IoRef::default();
         // Read all 5 bytes
-        assert!(stream.read_ioref(&mut ioref, 5).is_ok());
+        assert!(stream.get_ioref(&mut ioref, 5).is_ok());
         assert_eq!(ioref.len, 5);
         assert!(ioref.buf.is_some());
         assert_eq!(&ioref.buf.unwrap()[..], b"abcde");
@@ -420,13 +485,13 @@ mod tests {
     
     #[test]
     fn data_found_in_three_bufs_no_more_data_remain() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"a")).unwrap();
         stream.add_iobuf(new_iobuf(b"b")).unwrap();
         stream.add_iobuf(new_iobuf(b"c")).unwrap();
         let mut ioref = IoRef::default();
         // Read all 3 bytes, spanning all three bufs
-        assert!(stream.read_ioref(&mut ioref, 3).is_ok());
+        assert!(stream.get_ioref(&mut ioref, 3).is_ok());
         assert_eq!(ioref.len, 3);
         assert!(ioref.buf.is_some());
         assert_eq!(&ioref.buf.unwrap()[..], b"abc");
@@ -437,16 +502,16 @@ mod tests {
 
     #[test]
     fn read_past_current_and_wrap_around() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         // Add max possible bufs to leave one slot empty
-        for i in 0..MediaSourceStream::RING_SIZE - 1 {
+        for i in 0..RING_SIZE - 1 {
             let buf = new_iobuf(&[i as u8]);
             assert!(stream.add_iobuf(buf).is_ok());
         }
     
         // Read first 2 bufs to advance to the next buf
         let mut ioref_initial = IoRef::default();
-        assert!(stream.read_ioref(&mut ioref_initial, 2).is_ok());
+        assert!(stream.get_ioref(&mut ioref_initial, 2).is_ok());
         assert_eq!(stream.ring_cur_idx, 2);
         assert_eq!(stream.ring_cur_pos, 0);
 
@@ -458,10 +523,10 @@ mod tests {
         stream.add_iobuf(new_iobuf(b"a")).unwrap();
         stream.add_iobuf(new_iobuf(b"b")).unwrap();
     
-        // Read MediaSourceStream::RING_SIZE - 1 bytes which will span from the last buffer and wrap around
+        // Read RING_SIZE - 1 bytes which will span from the last buffer and wrap around
         let mut ioref = IoRef::default();
-        assert!(stream.read_ioref(&mut ioref, MediaSourceStream::RING_SIZE - 1).is_ok());
-        assert_eq!(ioref.len, MediaSourceStream::RING_SIZE - 1);
+        assert!(stream.get_ioref(&mut ioref, RING_SIZE - 1).is_ok());
+        assert_eq!(ioref.len, RING_SIZE - 1);
         assert!(ioref.buf.is_some());
     
         // The stream state should be updated to point to the correct position after the read
@@ -471,13 +536,13 @@ mod tests {
 
     #[test]
     fn get_u8_no_data() {
-        let mut stream = MediaSourceStream::default();
-        assert_eq!(stream.get_u8(), Err(MediaError::NotEnoughData));
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
+        assert_eq!(stream.get_u8(), Err(Error::RetryLater));
     }
 
     #[test]
     fn get_u8_test() {
-        let mut stream = MediaSourceStream::default();
+        let mut stream = MediaSourceStream::new(IoBufSupplierIoUring {});
         stream.add_iobuf(new_iobuf(b"abc")).unwrap();
         stream.add_iobuf(new_iobuf(b"de")).unwrap();
         
